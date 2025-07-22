@@ -230,13 +230,13 @@ def train_and_validate(model, train_loader, val_loader, optimizer, epochs=50, re
     return train_losses, val_losses, train_maes, val_maes, train_targets_over_epochs, train_preds_over_epochs, val_targets_over_epochs, val_preds_over_epochs
 
 
-# === Build Model with Best Hyperparameters ===
+
 best_model = build_gnn_model(num_nodes=151, num_layers=3)
 
-# === Define Optimizer with Best Learning Rate ===
+
 best_optimizer = torch.optim.Adam(best_model.parameters(), lr=0.07452)
 
-# === Train and Validate the Final Model ===
+
 train_losses, val_losses, train_maes, val_maes, \
 train_targets_over_epochs, train_preds_over_epochs, \
 val_targets_over_epochs, val_preds_over_epochs = train_and_validate(
