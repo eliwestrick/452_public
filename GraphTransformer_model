@@ -1,1 +1,203 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import train_test_split
+import matplotlib.pyplot as plt
 
+node_names = [
+    "lhjc", "left_hip", "lsjc", "lejc", "lkjc", "lajc", "lwjc",
+    "rhjc", "right_hip", "rsjc", "rejc", "rkjc", "rajc", "rwjc"
+]
+
+# reshapes the motion capture dataframe into swing tensors and labels
+def reshape_biomech_df(df, node_names, swing_col="session_swing", time_col="time"):
+    swings, targets = [], []
+    for swing_id, group in df.groupby(swing_col):
+        group = group.sort_values(time_col)
+        node_features = [group[[f"{node}_x", f"{node}_y", f"{node}_z"]].values.T for node in node_names]
+        swing_tensor = np.stack(node_features, axis=0).transpose(2, 0, 1)  # (T, N, 3)
+        swings.append(swing_tensor)
+        row = group.iloc[0]
+        targets.append([row["exit_velo_mph_x"], row["la"], row["dist"]])
+    return np.stack(swings), np.array(targets)
+
+class SwingDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
+    def __len__(self): return len(self.X)
+    def __getitem__(self, idx): return self.X[idx], self.y[idx]
+
+
+
+
+# load data, reshape as well
+df = pd.read_excel(r"C:\Users\eliwe\Documents\Data_files\data_resampled.xlsx")  # change to your actual path
+swing_tensor, swing_targets = reshape_biomech_df(df, node_names)
+
+# split data into train/val/test sets
+X_temp, X_test, y_temp, y_test = train_test_split(swing_tensor, swing_targets, test_size=0.2, random_state=42)
+X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.25, random_state=42)
+
+train_loader = DataLoader(SwingDataset(X_train, y_train), batch_size=32, shuffle=True)
+val_loader   = DataLoader(SwingDataset(X_val, y_val), batch_size=32)
+
+
+# applies attention across nodes (joints) and models motion over time
+class GraphTransformerModel(nn.Module):
+    def __init__(self, input_dim = 3, num_nodes = 14, hidden_dim = 64, num_heads = 4, num_layers = 2, output_dim = 3):
+        # input_dim = spatial coords (x, y, z)
+        # num_nodes = number of joints tracked
+        # hidden_dim = size of node embeddings
+        # num_heads = how many heads to use for attention
+        # num_layers = stacked transformer blocks
+        # output_dim = predicting EV, LA, and dist
+        super().__init__()
+
+        # maps input (x,y,z) into hidden space
+        self.node_proj = nn.Linear(input_dim, hidden_dim)
+
+        
+        # this applies attention over nodes at each time step independently
+        encoder_layer = nn.TransformerEncoderLayer(d_model = hidden_dim, nhead = num_heads, batch_first = True)
+        self.spatial_transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+       
+        # GRU models how spatial embeddings change across time
+        self.gru = nn.GRU(input_size = hidden_dim * num_nodes, hidden_size = hidden_dim, batch_first = True)
+
+       
+        # projects hidden state to 3 regression targets
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        B, T, N, D = x.shape  # B=batch, T=time steps, N=nodes, D=dimensions
+        x = self.node_proj(x)  # project (B, T, N, D) → (B, T, N, hidden)
+        
+        # apply transformer to each frame independently
+        spatial_encoded = []
+        for t in range(T):
+            frame = x[:, t]  # (B, N, hidden)
+            frame = self.spatial_transformer(frame)  # apply attention across nodes
+            spatial_encoded.append(frame)
+        x_spatial = torch.stack(spatial_encoded, dim = 1)  # (B, T, N, hidden)
+
+        # flatten node embeddings for temporal input
+        x_flat = x_spatial.view(B, T, -1)  # (B, T, N*hidden)
+        _, h = self.gru(x_flat)  # GRU outputs hidden state
+        return self.fc(h.squeeze(0))  # (B, 3)
+
+
+def build_graph_transformer_model(num_nodes, num_heads, num_layers):
+    return GraphTransformerModel(
+        input_dim = 3,
+        num_nodes = num_nodes,    
+        hidden_dim = 64,
+        num_heads = num_heads,
+        num_layers = num_layers,
+        output_dim = 3
+    )
+
+#same function from before, we will just pass it a different model, optimizer, ect
+def train_and_validate(model, train_loader, val_loader, optimizer, epochs = 50, return_avg_val_loss_only = False):
+    criterion = nn.MSELoss()  # Mean squared error for training
+    train_losses, val_losses = [], []
+    train_maes, val_maes = [], []
+    train_targets_over_epochs, train_preds_over_epochs = [], []
+    val_targets_over_epochs, val_preds_over_epochs = [], []
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_train_targets, epoch_train_preds = [], []
+        total_train_loss, total_train_mae = 0, 0
+
+        # Training Loop
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            total_train_loss += loss.item()
+            total_train_mae += F.l1_loss(output, y_batch).item()
+            epoch_train_targets.append(y_batch.cpu().numpy())
+            epoch_train_preds.append(output.detach().cpu().numpy())
+
+        train_targets_over_epochs.append(epoch_train_targets)
+        train_preds_over_epochs.append(epoch_train_preds)
+
+        avg_train_loss = total_train_loss / len(train_loader)
+        avg_train_mae = total_train_mae / len(train_loader)
+        train_losses.append(avg_train_loss)
+        train_maes.append(avg_train_mae)
+
+        # Validation Loop 
+        model.eval()
+        epoch_val_targets, epoch_val_preds = [], []
+        total_val_loss, total_val_mae = 0, 0
+
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                output = model(X_batch)
+                loss = criterion(output, y_batch)
+                total_val_loss += loss.item()
+                total_val_mae += F.l1_loss(output, y_batch).item()
+                epoch_val_targets.append(y_batch.cpu().numpy())
+                epoch_val_preds.append(output.cpu().numpy())
+
+        val_targets_over_epochs.append(epoch_val_targets)
+        val_preds_over_epochs.append(epoch_val_preds)
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_mae = total_val_mae / len(val_loader)
+        val_losses.append(avg_val_loss)
+        val_maes.append(avg_val_mae)
+
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f}, MAE: {avg_train_mae:.4f} | "
+              f"Val Loss: {avg_val_loss:.4f}, MAE: {avg_val_mae:.4f}")
+
+    if return_avg_val_loss_only:
+        return avg_val_loss
+
+    return train_losses, val_losses, train_maes, val_maes, train_targets_over_epochs, train_preds_over_epochs, val_targets_over_epochs, val_preds_over_epochs
+
+transformer_model = build_graph_transformer_model(num_nodes=14, num_heads=4, num_layers=3)
+
+# define optimizer for transformer model
+transformer_optimizer = torch.optim.Adam(transformer_model.parameters(), lr=0.07452)
+
+
+# train the graph transformer model and log metrics
+gt_train_losses, gt_val_losses, gt_train_maes, gt_val_maes, \
+gt_train_targets_over_epochs, gt_train_preds_over_epochs, \
+gt_val_targets_over_epochs, gt_val_preds_over_epochs = train_and_validate(
+    transformer_model,
+    train_loader,
+    val_loader,
+    transformer_optimizer,
+    epochs=50,
+    return_avg_val_loss_only=False
+)
+
+test_loader = DataLoader(SwingDataset(X_test, y_test), batch_size=32)
+
+# evaluate on test set
+transformer_model.eval()
+gt_test_loss, gt_test_mae = 0, 0
+
+with torch.no_grad():
+    for X_batch, y_batch in test_loader:
+        output = transformer_model(X_batch)
+        gt_test_loss += F.mse_loss(output, y_batch).item()
+        gt_test_mae += F.l1_loss(output, y_batch).item()
+
+gt_test_loss /= len(test_loader)
+gt_test_mae  /= len(test_loader)
+
+print("\n=== Graph Transformer Test Set Performance ===")
+print(f"Test Loss (MSE): {gt_test_loss:.4f}")
+print(f"Test MAE       : {gt_test_mae:.4f}")
