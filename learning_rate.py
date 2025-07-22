@@ -1,4 +1,4 @@
-# === Core Libraries ===
+
 import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
@@ -7,104 +7,110 @@ from torch.utils.data import Dataset, DataLoader
 from pyswarms.single.global_best import GlobalBestPSO
 import torch.nn as nn
 import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
+# Node Definitions
+# these are the anatomical landmarks tracked in the motion capture data
+node_names = [
+    "lhjc", "left_hip", "lsjc", "lejc", "lkjc", "lajc", "lwjc",
+    "rhjc", "right_hip", "rsjc", "rejc", "rkjc", "rajc", "rwjc"
+]
 
-# node definitions, these are the points of the body we are tracking in the df
-node_names = ["lhjc", "left_hip", "lsjc", "lejc", "lkjc", "lajc", "lwjc",
-              "rhjc", "right_hip", "rsjc", "rejc", "rkjc", "rajc", "rwjc"]
-
-
-#stores particle positions so we can visualize them later
+# Particle Position Log for Visualization
+# stores particle positions from PSO so we can visualize hyperparameter evolution
 position_log = []
 
-
-# converts the data which is time series data of x, y, z as well as 3 targets
-# into a 3D tensor of shape (swings, nodes, time, 3)
-def reshape_biomech_df(df, node_names, swing_col = "session_swing", time_col = "time"):
+# Reshape Raw Data into Tensors
+# converts raw dataframe into swing tensors and target labels
+def reshape_biomech_df(df, node_names, swing_col="session_swing", time_col="time"):
     swings, targets = [], []
-    for swing_id, group in df.groupby(swing_col):
-        group = group.sort_values(time_col)
-        # Extract 3D coordinates for each node across time
+    for swing_id, group in df.groupby(swing_col):  # group by swing
+        group = group.sort_values(time_col)  # sort by time
+        # extract 3D coordinates for each node across time
         node_features = [group[[f"{node}_x", f"{node}_y", f"{node}_z"]].values.T for node in node_names]
-        swing_tensor = np.stack(node_features, axis=0).transpose(2, 0, 1)  # (T, N, 3)
+        swing_tensor = np.stack(node_features, axis=0).transpose(2, 0, 1)  # shape: (T, N, 3)
         swings.append(swing_tensor)
-        # Extract swing outcome targets
-        row = group.iloc[0]
+        row = group.iloc[0]  # use first row to get target labels
         targets.append([row["exit_velo_mph_x"], row["la"], row["dist"]])
     return np.stack(swings), np.array(targets)
 
-#load the data and call the reshape funtion to make it 3d tensors
+# Load and Reshape Data
 df = pd.read_excel(r"C:\Users\eliwe\Documents\Data_files\data_resampled.xlsx")
 swing_tensor, swing_targets = reshape_biomech_df(df, node_names)
 
-
-# 60/20/20 split for train/val/test
+# Train/Val/Test Split
+# 60/20/20 split for training, validation, and testing
 X_temp, X_test, y_temp, y_test = train_test_split(swing_tensor, swing_targets, test_size=0.2, random_state=42)
 X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.25, random_state=42)
 
-
-
-# we now have 14 nodes of 3 dimensions (x,y,z) and 3 targets (exit velocity, launch angle, distance)
-
-
-
-
-
-
-# this uses the pytorch wrapper for the data
-class SwingDataset(torch.utils.data.Dataset): #defines class that inherits from pytorch dataset class
+# PyTorch Dataset Wrapper
+# wraps swing tensors and targets into a PyTorch dataset
+class SwingDataset(torch.utils.data.Dataset):
     def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32) #converts our tensors to pytorch tensors
+        self.X = torch.tensor(X, dtype=torch.float32)  # convert to torch tensors
         self.y = torch.tensor(y, dtype=torch.float32)
-    def __len__(self): return len(self.X) #gets how many swings we have so it knows what to expect
-    def __getitem__(self, idx): return self.X[idx], self.y[idx] #retrieves the swing at index (idx) and will pass it to the model during training
+    def __len__(self): return len(self.X)  # number of swings
+    def __getitem__(self, idx): return self.X[idx], self.y[idx]  # return one swing and its target
 
-# wraps the dataset in a dataloader so we can batch and shuffle ect
+#DataLoaders for Batching
+# creates train and val dataloaders for batching and shuffling
 train_loader = DataLoader(SwingDataset(X_train, y_train), batch_size=32, shuffle=True)
 val_loader   = DataLoader(SwingDataset(X_val, y_val), batch_size=32)
 
-# gnn-gru hybrid model)
+#GNN-GRU Hybrid Model with LRP
+# defines the model that encodes spatial and temporal features and predicts swing outcomes
 class GNN_GRU_Model(nn.Module):
-    def __init__(self, input_dim=3, num_nodes=14, hidden_dim=64, num_layers=2, output_dim=3): #dim is how many dimensions (x,y,z),
-        # num nodes is how many nodes we got, hiddden dim is nodes per hidden layer, layers is how many layers, and output dim is what dimension we
-        # want output in, so here it is 3 because we are predicting 3 things 
+    def __init__(self, input_dim=3, num_nodes=14, hidden_dim=64, num_layers=2, output_dim=3):
         super().__init__()
-        # this is for the spatial data, does linear transformation across nodes
+        # spatial encoder: stacked linear layers applied to each node
         self.gnn_layers = nn.ModuleList([
             nn.Linear(input_dim, hidden_dim) if i == 0 else nn.Linear(hidden_dim, hidden_dim)
             for i in range(num_layers)
         ])
-        # I believe this is for learning temporal dynamics
+        # temporal encoder: GRU processes node embeddings over time
         self.gru = nn.GRU(input_size=hidden_dim * num_nodes, hidden_size=hidden_dim, batch_first=True)
-        # this maps the current shape to the shape we want for the output
+        # final layer: maps GRU output to 3 swing metrics
         self.fc = nn.Linear(hidden_dim, output_dim)
 
-    def forward(self, x): 
-        B, T, N, D = x.shape
-        x = x.view(B * T, N, D)  #flatted the input to (B*T, N, D) for the gnn
+    def forward(self, x):
+        B, T, N, D = x.shape  # batch, time, nodes, dimensions
+        x = x.view(B * T, N, D)  # flatten time and batch for node-wise processing
         for layer in self.gnn_layers:
-            x = F.relu(layer(x))  # more spatial
-        x = x.view(B, T, -1)      # reshape it again
-        _, h = self.gru(x)        # GRU outputs hidden state
-        return self.fc(h.squeeze(0))  # this outputs the final predictions
+            x = F.relu(layer(x))  # apply spatial transformation
+        x = x.view(B, T, -1)  # reshape for GRU input
+        _, h = self.gru(x)  # GRU returns hidden state
+        return self.fc(h.squeeze(0))  # final prediction
 
-# call to build the model
+    def relevance_propagation(self, x, y_pred):
+        # estimates relevance of each node's input features to the prediction
+        # returns a tensor of shape (B, T, N, D)
+        B, T, N, D = x.shape
+        relevances = []
+        for b in range(B):
+            sample_relevance = []
+            for t in range(T):
+                relevance = y_pred[b].unsqueeze(0).unsqueeze(1) * x[b, t]
+                sample_relevance.append(relevance)
+            relevances.append(torch.stack(sample_relevance))
+        return relevances
+
+# Model Builder for PSO 
+# builds a model with given hyperparameters
 def build_gnn_model(num_nodes, num_layers):
     return GNN_GRU_Model(hidden_dim=num_nodes, num_layers=num_layers)
 
-
-#trains model over a given epochs and returns the validation loss
+#Training and Evaluation Loop
+# trains model for a few epochs and returns validation loss (used for PSO)
 def train_and_evaluate(model, optimizer, train_loader, val_loader, epochs=10):
-    loss_fn = nn.MSELoss() #makes our loss function mean squared error
+    loss_fn = nn.MSELoss()
     for epoch in range(epochs):
-        model.train() #sets to training mode
+        model.train()
         for X_batch, y_batch in train_loader:
             optimizer.zero_grad()
-            output = model(X_batch) #iterates over batches, and updates model weights
+            output = model(X_batch)
             loss = loss_fn(output, y_batch)
             loss.backward()
             optimizer.step()
-    #now do it on validation set
     model.eval()
     val_loss = 0
     with torch.no_grad():
@@ -113,49 +119,152 @@ def train_and_evaluate(model, optimizer, train_loader, val_loader, epochs=10):
             val_loss += loss_fn(output, y_batch).item()
     return val_loss / len(val_loader)
 
-#this gets the best hyperparameters using pyswarms
+# Objective Function for PSO
+# evaluates each particle's hyperparameter combo and returns its validation loss
 def objective_function(hyperparams):
-    global position_log #calls in the position log to the function
+    global position_log
     position_log.append(hyperparams.copy())  # log current particle positions
-
     losses = []
-    for p in hyperparams: #loops over each hyperparameter set and gets loss for it
+    for p in hyperparams:
         num_nodes = int(p[0])
-        lr = float(p[1]) #creates the parameter values, nodes, lr, and layers
+        lr = float(p[1])
         num_layers = int(round(p[2]))
-
-        model = build_gnn_model(num_nodes=num_nodes, num_layers = num_layers)
-        optimizer = torch.optim.Adam(model.parameters(), lr = lr) #creates a new model and optimizer for each hyperparameter set, and gets the loss for it
+        model = build_gnn_model(num_nodes=num_nodes, num_layers=num_layers)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
         loss = train_and_evaluate(model, optimizer, train_loader, val_loader, epochs=10)
         losses.append(loss)
-    return np.array(losses) #uses the records from the losses of each set to find the best hyperparameters
+    return np.array(losses)
 
+# Run PSO to Find Best Hyperparameters
+# runs particle swarm optimization to find best combo of nodes, layers, and learning rate
+bounds = (np.array([16, 0.001, 2]), np.array([256, 0.1, 3]))
+optimizer = GlobalBestPSO(n_particles=8, dimensions=3, options={'c1': 0.5, 'c2': 0.3, 'w': 0.9}, bounds=bounds)
+best_cost, best_pos = optimizer.optimize(objective_function, iters=10)
 
-bounds = (np.array([16, 0.001, 2]), np.array([256, 0.1, 3])) #create bounds for the hyperparameters
-optimizer = GlobalBestPSO(n_particles=8, dimensions=3, options={'c1': 0.5, 'c2': 0.3, 'w': 0.9}, bounds = bounds)
-best_cost, best_pos = optimizer.optimize(objective_function, iters = 10) # runs the pyswarm loop at 10 iterations
-
-#import for the plots
-import matplotlib.pyplot as plt
-
-position_log_np = np.array(position_log)  #make a numpy array so we can plot it
-params = ["Nodes per Layer", "Learning Rate", "Number of Layers"] #define params
+#Visualization of Hyperparameter Evolution
+# plots how each particle explored the hyperparameter space over time
+position_log_np = np.array(position_log)
+params = ["Nodes per Layer", "Learning Rate", "Number of Layers"]
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
 for i in range(3):
-    param_vals = position_log_np[:, :, i]  # (iters, particles)
+    param_vals = position_log_np[:, :, i]
     for particle in range(param_vals.shape[1]):
         axes[i].plot(param_vals[:, particle], alpha=0.6)
     axes[i].set_title(params[i])
     axes[i].set_xlabel("Iteration")
     axes[i].set_ylabel("Value")
     axes[i].grid(True)
-#loops for each parameter and plots the values across the 10 iterations
+
 plt.suptitle("Hyperparameter Evolution Across Particles")
 plt.tight_layout()
 plt.show()
 
-#prints the best hyperparameters
+# Print Best Hyperparameters Found
 print(f"nodes: {int(best_pos[0])}")
 print(f"lr: {best_pos[1]:.5f}")
 print(f"layers: {int(round(best_pos[2]))}")
+
+
+def train_and_validate(model, train_loader, val_loader, optimizer, epochs=50, return_avg_val_loss_only=False):
+    criterion = nn.MSELoss()  # Mean squared error for training
+    train_losses, val_losses = [], []
+    train_maes, val_maes = [], []
+    train_targets_over_epochs, train_preds_over_epochs = [], []
+    val_targets_over_epochs, val_preds_over_epochs = [], []
+
+    for epoch in range(epochs):
+        model.train()
+        epoch_train_targets, epoch_train_preds = [], []
+        total_train_loss, total_train_mae = 0, 0
+
+        # Training Loop
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            loss.backward()
+            optimizer.step()
+
+            total_train_loss += loss.item()
+            total_train_mae += F.l1_loss(output, y_batch).item()
+            epoch_train_targets.append(y_batch.cpu().numpy())
+            epoch_train_preds.append(output.detach().cpu().numpy())
+
+        train_targets_over_epochs.append(epoch_train_targets)
+        train_preds_over_epochs.append(epoch_train_preds)
+
+        avg_train_loss = total_train_loss / len(train_loader)
+        avg_train_mae = total_train_mae / len(train_loader)
+        train_losses.append(avg_train_loss)
+        train_maes.append(avg_train_mae)
+
+        # Validation Loop 
+        model.eval()
+        epoch_val_targets, epoch_val_preds = [], []
+        total_val_loss, total_val_mae = 0, 0
+
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                output = model(X_batch)
+                loss = criterion(output, y_batch)
+                total_val_loss += loss.item()
+                total_val_mae += F.l1_loss(output, y_batch).item()
+                epoch_val_targets.append(y_batch.cpu().numpy())
+                epoch_val_preds.append(output.cpu().numpy())
+
+        val_targets_over_epochs.append(epoch_val_targets)
+        val_preds_over_epochs.append(epoch_val_preds)
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        avg_val_mae = total_val_mae / len(val_loader)
+        val_losses.append(avg_val_loss)
+        val_maes.append(avg_val_mae)
+
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.4f}, MAE: {avg_train_mae:.4f} | "
+              f"Val Loss: {avg_val_loss:.4f}, MAE: {avg_val_mae:.4f}")
+
+    if return_avg_val_loss_only:
+        return avg_val_loss
+
+    return train_losses, val_losses, train_maes, val_maes, train_targets_over_epochs, train_preds_over_epochs, val_targets_over_epochs, val_preds_over_epochs
+
+
+# === Build Model with Best Hyperparameters ===
+best_model = build_gnn_model(num_nodes=151, num_layers=3)
+
+# === Define Optimizer with Best Learning Rate ===
+best_optimizer = torch.optim.Adam(best_model.parameters(), lr=0.07452)
+
+# === Train and Validate the Final Model ===
+train_losses, val_losses, train_maes, val_maes, \
+train_targets_over_epochs, train_preds_over_epochs, \
+val_targets_over_epochs, val_preds_over_epochs = train_and_validate(
+    best_model,
+    train_loader,
+    val_loader,
+    best_optimizer,
+    epochs=50,
+    return_avg_val_loss_only=False
+)
+
+
+test_loader = DataLoader(SwingDataset(X_test, y_test), batch_size=32)
+
+
+best_model.eval()
+total_test_loss, total_test_mae = 0, 0
+
+with torch.no_grad():  
+    for X_batch, y_batch in test_loader:
+        output = best_model(X_batch)
+        total_test_loss += F.mse_loss(output, y_batch).item()
+        total_test_mae  += F.l1_loss(output, y_batch).item()
+
+avg_test_loss = total_test_loss / len(test_loader)
+avg_test_mae  = total_test_mae / len(test_loader)
+
+
+print("\n=== Final Test Set Performance ===")
+print(f"Test Loss (MSE): {avg_test_loss:.4f}")
+print(f"Test MAE       : {avg_test_mae:.4f}")
