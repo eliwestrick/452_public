@@ -35,7 +35,7 @@ class SwingDataset(Dataset):
 
 
 # load data, reshape as well
-df = pd.read_excel(r"C:\Users\eliwe\Documents\Data_files\data_resampled.xlsx")  # change to your actual path
+df = pd.read_excel(r"C:\Users\eliwe\Documents\Data_files\data_resampled.xlsx")  
 swing_tensor, swing_targets = reshape_biomech_df(df, node_names)
 
 # split data into train/val/test sets
