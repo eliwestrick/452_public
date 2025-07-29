@@ -15,7 +15,7 @@ node_names = [
     "rhjc", "right_hip", "rsjc", "rejc", "rkjc", "rajc", "rwjc"
 ]
 
-# edges define the skeleton connectivity between nodes
+# edges define the spatial dependancies between nodes
 edges = [
     ("lsjc", "lejc"), ("lejc", "lwjc"), ("lwjc", "lhjc"),
     ("rsjc", "rejc"), ("rejc", "rwjc"), ("rwjc", "rhjc"),
